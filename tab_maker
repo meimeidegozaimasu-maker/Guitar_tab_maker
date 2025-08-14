@@ -1,0 +1,1154 @@
+import React, { useEffect, useRef, useState } from "react";
+
+// ===== Guitar 6-String Tab Editor (v3, rewritten single file) =====
+// 要件:
+// - モード: 選択(Select) / 描画(Draw)
+// - 描画モード: 直近に押した数字(0-24の連結入力対応) or x(ミュート) を配置。未設定は 0。
+// - クリック=配置、ダブルクリック=インライン編集（数字のみ / × は編集不可）
+// - 編集枠は外クリック/ツールバー操作でも確定し、選択解除
+// - 選択モード: 単体選択 + 矩形範囲選択、矢印キーで移動（このモード時のみ）
+// - 移動/配置の上書き: 既存があれば上書き
+// - 弦方向はみ出しは削除（0..5以外は捨てる）
+// - クリック位置補正（pagePadding + leftPadding）を維持
+
+// ===== 型 =====
+
+type Tuning = number[]; // MIDI（表示は文字）
+
+type NoteKind = "fret" | "mute"; // mute は ×
+
+type TabItem = {
+  id: string;
+  rowIndex: number; // どの行か
+  bar: number;
+  tick: number;
+  stringIndex: number; // 0..5（0=1弦）
+  kind: NoteKind;
+  fret?: number; // kind=fret のとき 0..24
+};
+
+type HistoryState = {
+  items: TabItem[];
+  bars: number;
+  beatsPerBar: number;
+  division: number;
+  perSystemBars: number;
+};
+
+// ===== ユーティリティ =====
+
+const defaultTuning: Tuning = [64, 59, 55, 50, 45, 40]; // E4 B3 G3 D3 A2 E2
+const tuningNames = ["E4", "B3", "G3", "D3", "A2", "E2"]; // 表示用
+const uid = () => Math.random().toString(36).slice(2, 10);
+const clamp = (n: number, a: number, b: number) => Math.max(a, Math.min(b, n));
+
+// 安全な client座標 -> SVG(viewBox)座標 変換（0幅/0高・NaN・CTMなしを吸収）
+const clientToSvg = (svg: SVGSVGElement, clientX: number, clientY: number) => {
+  const r = svg.getBoundingClientRect();
+  const vb = svg.viewBox?.baseVal;
+  const safeW = r.width || 1;   // 0除算回避
+  const safeH = r.height || 1;
+  let x = (clientX - r.left) * ((vb?.width  || svg.width.baseVal.value  || 1) / safeW);
+  let y = (clientY - r.top)  * ((vb?.height || svg.height.baseVal.value || 1) / safeH);
+
+  if (!Number.isFinite(x) || !Number.isFinite(y)) {
+    const pt = svg.createSVGPoint();
+    pt.x = clientX; pt.y = clientY;
+    const ctm = svg.getScreenCTM();
+    if (ctm) {
+      const loc = pt.matrixTransform(ctm.inverse());
+      x = loc.x; y = loc.y;
+    } else {
+      x = 0; y = 0;
+    }
+  }
+  return { x, y };
+};
+
+// ==== 音名ユーティリティ ====
+const noteNames = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"];
+
+const midiToName = (midi: number) => {
+  const name = noteNames[midi % 12];
+  const octave = Math.floor(midi / 12) - 1; // MIDI規格: 60=C4
+  return `${name}${octave}`;
+};
+
+// ===== メインコンポーネント =====
+
+export default function App() {
+  // 楽譜プロパティ
+  const [bars, setBars] = useState(8);
+  const [beatsPerBar, setBeatsPerBar] = useState(4);
+  const [division, setDivision] = useState(4); // 1拍あたりのグリッド数（4 = 16分）
+  const [perSystemBars, setPerSystemBars] = useState(4); // 1段の小節数（表示にのみ使用）
+  const [tuning] = useState<Tuning>(defaultTuning);
+
+  // ノート（アイテム）
+  const [items, setItems] = useState<TabItem[]>([]);
+
+  // 譜面の行
+  const [rowCount, setRowCount] = useState(1);
+
+  // 横スクロールの同期（デフォルトON）
+  const [linkScroll, setLinkScroll] = useState(true);
+
+  // 使っていないが残す：将来的なドラッグ検出の予備
+  const dragDetectRef = useRef<{
+    arming: boolean;
+    startClientX: number;
+    startClientY: number;
+    item?: TabItem;
+  } | null>(null);
+
+  // 各行のスクロール要素参照
+  const scrollRefs = useRef<HTMLDivElement[]>([]);
+  scrollRefs.current = Array.from({ length: rowCount }, (_, i) => scrollRefs.current[i] || null) as any;
+
+  // スクロール同期中のループ抑止フラグ
+  const isSyncingScrollRef = useRef(false);
+
+  // モード
+  type Mode = "select" | "draw";
+  const [mode, setMode] = useState<Mode>("draw");
+
+  // 描画モードの直近キー
+  const [drawToken, setDrawToken] = useState<{ kind: NoteKind; value?: number } | null>(null);
+
+  // 選択
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const isSelected = (id: string) => selectedIds.includes(id);
+
+  // 矩形選択
+  const [marquee, setMarquee] = useState<null | { x0: number; y0: number; x1: number; y1: number }>(null);
+  const [draggingMarquee, setDraggingMarquee] = useState(false);
+
+  // インライン編集
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editValue, setEditValue] = useState<string>("");
+
+  // Undo/Redo
+  const [undoStack, setUndoStack] = useState<HistoryState[]>([]);
+  const [redoStack, setRedoStack] = useState<HistoryState[]>([]);
+
+  const pushHistory = () => {
+    setUndoStack((st) => [
+      ...st,
+      { items: structuredClone(items), bars, beatsPerBar, division, perSystemBars },
+    ]);
+    setRedoStack([]);
+  };
+
+  const undo = () => {
+    const prev = undoStack[undoStack.length - 1];
+    if (!prev) return;
+    setRedoStack((r) => [
+      { items: structuredClone(items), bars, beatsPerBar, division, perSystemBars },
+      ...r,
+    ]);
+    setUndoStack((st) => st.slice(0, -1));
+    setItems(prev.items);
+    setBars(prev.bars);
+    setBeatsPerBar(prev.beatsPerBar);
+    setDivision(prev.division);
+    setPerSystemBars(prev.perSystemBars);
+    setSelectedIds([]);
+    setEditingId(null);
+  };
+
+  const redo = () => {
+    const nxt = redoStack[0];
+    if (!nxt) return;
+    setUndoStack((st) => [
+      ...st,
+      { items: structuredClone(items), bars, beatsPerBar, division, perSystemBars },
+    ]);
+    setRedoStack((r) => r.slice(1));
+    setItems(nxt.items);
+    setBars(nxt.bars);
+    setBeatsPerBar(nxt.beatsPerBar);
+    setDivision(nxt.division);
+    setPerSystemBars(nxt.perSystemBars);
+    setEditingId(null);
+  };
+
+  // レイアウト（px）
+  const zoom = 1;
+  const pagePadding = 0;
+  const leftPadding = 0; // 左マージンをゼロにしてラベル右端に密着
+  const rightPadding = 24 * zoom;
+  const topPadding = 20 * zoom;
+  const bottomPadding = 24 * zoom;
+  const stringGap = 22 * zoom;
+  const stringCount = 6;
+
+  const ticksPerBar = beatsPerBar * division;
+
+  // 横スクロール基準：1小節のピクセル幅（好みで調整）
+  const barPx = 160 * zoom;
+  const pxPerTick = barPx / (ticksPerBar || 1);
+
+  // 1行のSVGサイズ（横に長い）
+  const rowSvgWidth  = pagePadding * 2 + leftPadding + bars * barPx + rightPadding;
+  const rowSvgHeight = pagePadding * 2 + (stringCount - 1) * stringGap + topPadding + bottomPadding;
+
+  // 表示オプション
+  const [showSubdivision, setShowSubdivision] = useState(true);
+  const [showBeat, setShowBeat] = useState(true);
+  const [showBarNumber, setShowBarNumber] = useState(true);
+
+  // エクスポートメニュー
+  const [exportOpen, setExportOpen] = useState(false);
+  const exportMenuRef = useRef<HTMLDivElement | null>(null);
+
+  // ドラッグ中フラグ（カーソル強制用）
+  const [isDragging, setIsDragging] = useState(false);
+
+  const dragRef = useRef<{
+    active: boolean;
+    pointerId: number | null;
+    rowIndex: number;
+    startCursorBar: number;
+    startCursorTick: number;
+    startCursorString: number;
+    captureEl?: SVGSVGElement;
+    captureTarget?: Element;
+    startBar: number;
+    startTick: number;
+    startString: number;
+    dxTick: number;
+    dyString: number;
+  } | null>(null);
+
+  const svgRefs = useRef<(SVGSVGElement | null)[]>([]);
+  const getRowSvg = (rowIndex: number) => svgRefs.current[rowIndex] ?? null;
+  // 編集開始直後の誤 blur/外クリック無視
+  const justBeganEditRef = useRef(false);
+  // 数字キーの連結入力（1秒以内）
+  const digitComposeRef = useRef<{ value: number; time: number } | null>(null);
+
+  // 横スクロール版: 全体の絶対tickをそのままXに
+  const xOf = (bar: number, tick: number) => {
+    const absTicks = bar * ticksPerBar + tick;
+    return leftPadding + absTicks * pxPerTick;
+  };
+
+  const quantizeX = (x: number) => {
+    if (!Number.isFinite(x)) x = pagePadding + leftPadding; // 非Finiteなら左端へエスケープ
+    const leftEdge  = pagePadding + leftPadding;
+    const rightEdge = pagePadding + leftPadding + bars * barPx;
+    const clampedX  = clamp(x, leftEdge, rightEdge);
+    const tickFloat = (clampedX - leftEdge) / (pxPerTick || 1);
+    const tpb = (ticksPerBar || 1);
+    const bar = clamp(Math.floor(tickFloat / tpb), 0, bars - 1);
+    const tickInBar = clamp(Math.round(tickFloat - bar * tpb), 0, tpb - 1);
+    return { bar, tick: tickInBar };
+  };
+
+  const yForString = (stringIndex: number) => {
+    const y0 = pagePadding + topPadding;
+    return y0 + stringIndex * stringGap;
+  };
+
+  // ==== 入力と編集（座標→譜面位置） ====
+  const [hoverPos, setHoverPos] = useState<{ bar: number; tick: number; stringIndex: number } | null>(null);
+
+  const cancelEditingAndSelection = () => {
+    if (justBeganEditRef.current) return;
+    if (editingId) commitInlineEdit();
+    setSelectedIds([]);
+  };
+
+  const placeAtRow = (rowIndex: number, pos: { bar: number; tick: number; stringIndex: number }) => {
+    const token = drawToken || { kind: "fret" as NoteKind, value: 0 };
+    const newItem: TabItem = token.kind === "mute"
+      ? { id: uid(), rowIndex, bar: pos.bar, tick: pos.tick, stringIndex: pos.stringIndex, kind: "mute" }
+      : { id: uid(), rowIndex, bar: pos.bar, tick: pos.tick, stringIndex: pos.stringIndex, kind: "fret", fret: clamp(token.value ?? 0, 0, 24) };
+    pushHistory();
+    setItems((arr) => {
+      const noOld = arr.filter(i => !(i.rowIndex === rowIndex && i.bar === pos.bar && i.tick === pos.tick && i.stringIndex === pos.stringIndex));
+      return [...noOld, newItem];
+    });
+  };
+
+  // ==== ドラッグ時のカーソル固定（body/htmlにフラグを立てる） ====
+  useEffect(() => {
+    const html = document.documentElement;
+    const body = document.body;
+    if (isDragging) {
+      html.setAttribute("data-dragging", "1");
+      body.style.cursor = "grabbing";
+    } else {
+      html.removeAttribute("data-dragging");
+      body.style.cursor = "";
+    }
+    return () => {
+      html.removeAttribute("data-dragging");
+      body.style.cursor = "";
+    };
+  }, [isDragging]);
+
+  // === グローバル DnD ===
+  const onGlobalPointerMove = (ev: PointerEvent) => {
+    const dr = dragRef.current;
+    if (!dr || !dr.active) return;
+
+    const svg = dr.captureEl ?? getRowSvg(dr.rowIndex);
+    if (!svg) return;
+
+    const loc = clientToSvg(svg, ev.clientX, ev.clientY);
+
+    // 現在カーソルのグリッドを量子化
+    const y0 = pagePadding + topPadding;
+    const yAdj = clamp(
+      loc.y,
+      y0 - stringGap / 2,
+      y0 + (stringCount - 1) * stringGap + stringGap / 2
+    );
+    const curString = clamp(Math.round((yAdj - y0) / stringGap), 0, stringCount - 1);
+
+    const { bar: curBar, tick: curTick } = quantizeX(loc.x);
+
+    // 差分は「現在カーソル − 開始カーソル」
+    const startCursorAbs = dr.startCursorBar * (ticksPerBar || 1) + dr.startCursorTick;
+    const curAbs         = curBar * (ticksPerBar || 1) + curTick;
+
+    dragRef.current = {
+      ...dr,
+      dxTick:   curAbs - startCursorAbs,
+      dyString: curString - dr.startCursorString,
+    };
+  };
+
+  const cleanupDragSideEffects = () => {
+    const dr = dragRef.current;
+    if (dr?.captureEl) {
+      try { dr.captureEl.classList.remove("dragging"); } catch {}
+    }
+    setIsDragging(false);
+    document.removeEventListener("pointermove", onGlobalPointerMove);
+    document.removeEventListener("pointerup", onGlobalPointerUp);
+  };
+
+  const onGlobalPointerUp = (ev: PointerEvent) => {
+    const dr = dragRef.current;
+    if (!dr || !dr.active) { cleanupDragSideEffects(); return; }
+
+    const dx = dr.dxTick | 0;
+    const dy = dr.dyString | 0;
+    if (dx !== 0 || dy !== 0) {
+      moveSelection(dx, dy);
+    }
+
+    // pointer capture を安全に解放
+    if (dr.pointerId != null && dr.captureTarget) {
+      try {
+        const tgt = dr.captureTarget as any;
+        if (typeof tgt.hasPointerCapture === "function") {
+          if (tgt.hasPointerCapture(dr.pointerId)) {
+            tgt.releasePointerCapture(dr.pointerId);
+          }
+        } else {
+          tgt.releasePointerCapture?.(dr.pointerId);
+        }
+      } catch {}
+    }
+
+    cleanupDragSideEffects();
+    dragRef.current = null;
+    ev.preventDefault?.();
+  };
+
+  const beginDragFromItem = (
+    e: React.PointerEvent<SVGGElement>,
+    it: TabItem,
+    rowIndex: number
+  ) => {
+    if (mode !== "select" || editingId) return;
+
+    setSelectedIds(prev => (prev.includes(it.id) ? prev : [it.id]));
+    setDraggingMarquee(false);
+    setMarquee(null);
+
+    const pid = (e as any).pointerId ?? (e.nativeEvent as any)?.pointerId ?? null;
+    const svgEl = getRowSvg(rowIndex) ?? (e.currentTarget as SVGGElement).ownerSVGElement ?? null;
+
+    let startCursorBar = it.bar, startCursorTick = it.tick, startCursorString = it.stringIndex;
+    if (svgEl) {
+      const loc = clientToSvg(svgEl, (e.nativeEvent as any).clientX ?? 0, (e.nativeEvent as any).clientY ?? 0);
+      const y0 = pagePadding + topPadding;
+      const yAdj = clamp(loc.y, y0 - stringGap / 2, y0 + (stringCount - 1) * stringGap + stringGap / 2);
+      startCursorString = clamp(Math.round((yAdj - y0) / stringGap), 0, stringCount - 1);
+      const qt = quantizeX(loc.x);
+      startCursorBar = qt.bar;
+      startCursorTick = qt.tick;
+    }
+
+    if (pid != null) { try { (e.currentTarget as SVGGElement).setPointerCapture(pid); } catch {} }
+
+    dragRef.current = {
+      active: true,
+      pointerId: pid,
+      rowIndex,
+      captureEl: svgEl || undefined,
+      captureTarget: e.currentTarget as Element,
+      startBar: it.bar,
+      startTick: it.tick,
+      startString: it.stringIndex,
+      startCursorBar,
+      startCursorTick,
+      startCursorString,
+      dxTick: 0,
+      dyString: 0,
+    };
+
+    if (svgEl) {
+      try { svgEl.classList.add("dragging"); } catch {}
+    }
+    setIsDragging(true);
+
+    document.addEventListener("pointermove", onGlobalPointerMove, { passive: true });
+    document.addEventListener("pointerup", onGlobalPointerUp);
+    e.stopPropagation();
+    e.preventDefault();
+  };
+
+  const normRect = (m: { x0: number; y0: number; x1: number; y1: number }) => {
+    const x = Math.min(m.x0, m.x1);
+    const y = Math.min(m.y0, m.y1);
+    return { x, y, w: Math.abs(m.x1 - m.x0), h: Math.abs(m.y1 - m.y0) };
+  };
+
+  // 選択移動
+  const moveSelection = (dxTick: number, dyString: number) => {
+    if (mode !== "select") return;
+    if (selectedIds.length === 0) return;
+
+    pushHistory();
+    setItems((arr) => {
+      const sel = arr.filter((i) => selectedIds.includes(i.id));
+      const rest = arr.filter((i) => !selectedIds.includes(i.id));
+
+      const moved: TabItem[] = [];
+      for (const it of sel) {
+        let bar = it.bar;
+        let tick = it.tick + dxTick;
+        let stringIndex = it.stringIndex + dyString;
+
+        // 小節またぎ
+        while (tick < 0) { bar = Math.max(0, bar - 1); tick += (ticksPerBar || 1); }
+        while (tick >= (ticksPerBar || 1)) { tick -= (ticksPerBar || 1); bar = Math.min(bars - 1, bar + 1); }
+
+        // 弦はみ出し→破棄
+        if (stringIndex < 0 || stringIndex > 5) continue;
+        moved.push({ ...it, bar, tick, stringIndex });
+      }
+
+      // 上書き
+      let next = [...rest];
+      for (const it of moved) {
+        next = next.filter((x) => !(x.bar === it.bar && x.tick === it.tick && x.stringIndex === it.stringIndex && x.rowIndex === it.rowIndex));
+        next.push(it);
+      }
+      return next;
+    });
+  };
+
+  const canReset = items.length > 0;
+  const canUndo  = undoStack.length > 0;
+  const canRedo  = redoStack.length > 0;
+
+  // ==== 描画モードのピッチ表示用テキスト ====
+  const pitchText: string | null = (() => {
+    if (mode !== "draw") return null;
+    if (drawToken?.kind === "mute") return "mute";
+    const fret = clamp(drawToken?.value ?? 0, 0, 24);
+    if (!hoverPos) return "—";
+    const base = tuning[hoverPos.stringIndex];
+    const midi = base + fret;
+    return midiToName(midi);
+  })();
+
+  // DnD プレビュー
+  const computeDragPreview = (): TabItem[] => {
+    const dr = dragRef.current;
+    if (!dr || !dr.active) return [];
+    const { dxTick, dyString } = dr;
+    if (dxTick === 0 && dyString === 0) return [];
+
+    const sel = items.filter((i) => selectedIds.includes(i.id));
+    const preview: TabItem[] = [];
+
+    for (const it of sel) {
+      let bar = it.bar;
+      let tick = it.tick + dxTick;
+      let stringIndex = it.stringIndex + dyString;
+
+      while (tick < 0) { bar = Math.max(0, bar - 1); tick += (ticksPerBar || 1); }
+      while (tick >= (ticksPerBar || 1)) { tick -= (ticksPerBar || 1); bar = Math.min(bars - 1, bar + 1); }
+      if (stringIndex < 0 || stringIndex > 5) continue;
+      preview.push({ ...it, bar, tick, stringIndex });
+    }
+    return preview;
+  };
+
+  const beginInlineEdit = (id: string) => {
+    const n = items.find((x) => x.id === id); if (!n) return;
+    if (n.kind === "mute") return; // ×は編集しない
+    setSelectedIds([id]);
+    setEditingId(id);
+    setEditValue(String(n.fret ?? 0));
+    justBeganEditRef.current = true;
+    setTimeout(() => { justBeganEditRef.current = false; }, 50);
+  };
+
+  const commitInlineEdit = () => {
+    if (!editingId) return;
+    const v0 = parseInt(editValue || "0", 10);
+    const v = clamp(Number.isFinite(v0) ? v0 : 0, 0, 24);
+    setItems((arr) => arr.map((n) => (n.id === editingId ? { ...n, kind: "fret", fret: v } : n)));
+    setEditingId(null);
+    setSelectedIds([]);
+  };
+
+  // ==== キーハンドリング（windowへ集約） ====
+  useEffect(() => {
+    const isEditableEl = (el: Element | null) => {
+      if (!el) return false;
+      const he = el as HTMLElement;
+      const tag = he.tagName.toLowerCase();
+      if (tag === "input" || tag === "textarea") return true;
+      if (he.isContentEditable) return true;
+      return false;
+    };
+
+    const onKey = (e: KeyboardEvent) => {
+      if (e.isComposing) return;
+      if (editingId) return;
+      if (isEditableEl(document.activeElement)) return;
+
+      // Undo/Redo
+      if ((e.metaKey || e.ctrlKey) && (e.key === "z" || e.key === "Z")) {
+        e.preventDefault();
+        e.shiftKey ? redo() : undo();
+        return;
+      }
+      if ((e.metaKey || e.ctrlKey) && (e.key === "y" || e.key === "Y")) {
+        e.preventDefault();
+        redo();
+        return;
+      }
+
+      if (mode === "draw") {
+        if (/^[0-9]$/.test(e.key)) {
+          const d = Number(e.key);
+          const now = Date.now();
+          const buf = digitComposeRef.current;
+          let newVal: number;
+          if (buf && now - buf.time <= 1000) {
+            const cand = buf.value * 10 + d;
+            newVal = cand <= 24 ? cand : d;
+          } else {
+            newVal = d;
+          }
+          digitComposeRef.current = { value: newVal, time: now };
+          setDrawToken({ kind: "fret", value: newVal });
+          e.preventDefault();
+          return;
+        }
+        if (e.key === "x" || e.key === "X") {
+          digitComposeRef.current = null;
+          setDrawToken({ kind: "mute" });
+          e.preventDefault();
+          return;
+        }
+        return;
+      }
+
+      if (mode === "select") {
+        if (e.key === "ArrowLeft")  { e.preventDefault(); moveSelection(-1, 0); return; }
+        if (e.key === "ArrowRight") { e.preventDefault(); moveSelection(1, 0);  return; }
+        if (e.key === "ArrowUp")    { e.preventDefault(); moveSelection(0, -1); return; }
+        if (e.key === "ArrowDown")  { e.preventDefault(); moveSelection(0, 1);  return; }
+        if (e.key === "Delete" || e.key === "Backspace") {
+          e.preventDefault();
+          if (selectedIds.length) {
+            pushHistory();
+            setItems(arr => arr.filter(i => !selectedIds.includes(i.id)));
+            setSelectedIds([]);
+          }
+          return;
+        }
+      }
+    };
+
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [mode, editingId, selectedIds, items, bars, beatsPerBar, division, perSystemBars]);
+
+  // エクスポートメニュー：外側クリック / Esc で閉じる
+  useEffect(() => {
+    const onDocClick = (e: MouseEvent) => {
+      if (exportMenuRef.current && !exportMenuRef.current.contains(e.target as Node)) {
+        setExportOpen(false);
+      }
+    };
+    const onEsc = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setExportOpen(false);
+    };
+    document.addEventListener("mousedown", onDocClick);
+    document.addEventListener("keydown", onEsc);
+    return () => {
+      document.removeEventListener("mousedown", onDocClick);
+      document.removeEventListener("keydown", onEsc);
+    };
+  }, []);
+
+  // ==== 出力 ====
+  const getActiveRowSvg = (): SVGSVGElement | null => {
+    return svgRefs.current[0] ?? (document.querySelector("svg.row-svg") as SVGSVGElement | null);
+  };
+
+  const svgToBlob = () => {
+    const svgEl = getActiveRowSvg();
+    if (!svgEl) return null;
+    const serializer = new XMLSerializer();
+    const source = serializer.serializeToString(svgEl);
+    return new Blob([source], { type: "image/svg+xml;charset=utf-8" });
+  };
+
+  const downloadSVG = () => {
+    const blob = svgToBlob(); if (!blob) return;
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = "tab.svg"; a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const downloadPNG = async () => {
+    const blob = svgToBlob(); if (!blob) return;
+    const url = URL.createObjectURL(blob);
+    const img = new Image(); img.src = url; await img.decode();
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.ceil(rowSvgWidth); canvas.height = Math.ceil(rowSvgHeight);
+    const ctx = canvas.getContext("2d"); if (!ctx) return;
+    ctx.fillStyle = "white"; ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(img, 0, 0);
+    const png = canvas.toDataURL("image/png");
+    const a = document.createElement("a"); a.href = png; a.download = "tab.png"; a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  // ==== レンダリング補助 ====
+  const drawText = (x: number, y: number, t: string, color = "#111", bold = true) => (
+    <text x={x} y={y} dominantBaseline="middle" textAnchor="middle" fontFamily="ui-monospace, Menlo, monospace" fontSize={13} fontWeight={bold ? 700 : 600} fill={color}>{t}</text>
+  );
+
+  const itemXYRow = (n: TabItem) => {
+    const x = pagePadding + xOf(n.bar, n.tick);
+    const y = yForString(n.stringIndex);
+    return { x, y };
+  };
+
+  const hitTestItemAtX = (rowIndex: number, x: number, y: number) => {
+    for (const it of items) {
+      if (it.rowIndex !== rowIndex) continue;
+      const { x: ix, y: iy } = itemXYRow(it);
+      if (Math.abs(ix - x) <= 12 && Math.abs(iy - y) <= 12) return it;
+    }
+    return null;
+  };
+
+  // 一行の描画
+  const renderRow = (rowIndex: number) => {
+    // 左固定カラム（弦名）
+    const LeftFixed = () => (
+      <div className="row-left-fixed">
+        {[...Array(6)].map((_, s) => (
+          <div key={s} className="row-left-line" style={{ top: yForString(s) }}>
+            <span className="row-left-name">{tuningNames[s]}</span>
+          </div>
+        ))}
+      </div>
+    );
+
+    // 右スクロール + SVG
+    const RightScroll = () => (
+      <div
+        className="row-right-scroll"
+        ref={(el) => { if (el) scrollRefs.current[rowIndex] = el; }}
+        onScroll={(ev) => {
+          if (!linkScroll) return;
+          if (isSyncingScrollRef.current) return;
+          const src = ev.currentTarget;
+          isSyncingScrollRef.current = true;
+          scrollRefs.current.forEach((el, i) => {
+            if (!el || i === rowIndex) return;
+            el.scrollLeft = src.scrollLeft;
+          });
+          isSyncingScrollRef.current = false;
+        }}
+      >
+      <svg
+        ref={(el) => { svgRefs.current[rowIndex] = el; }}
+        width={rowSvgWidth}
+        height={rowSvgHeight}
+        viewBox={`0 0 ${rowSvgWidth} ${rowSvgHeight}`}
+        onPointerMove={(e) => {
+          const svg = svgRefs.current[rowIndex] ?? (e.currentTarget as SVGSVGElement);
+          if (!svg) return;
+          const loc = clientToSvg(svg, e.clientX, e.clientY);
+
+          const y0 = pagePadding + topPadding;
+          const y = clamp(loc.y, y0 - stringGap / 2, y0 + (stringCount - 1) * stringGap + stringGap / 2);
+          const stringIndex = clamp(Math.round((y - y0) / stringGap), 0, stringCount - 1);
+
+          const { bar, tick } = quantizeX(loc.x);
+          setHoverPos({ bar, tick, stringIndex });
+
+          if (draggingMarquee) {
+            setMarquee((m) => (m ? { ...m, x1: loc.x, y1: loc.y } : m));
+          }
+        }}
+
+          onPointerLeave={() => setHoverPos(null)}
+          onPointerDown={(e) => {
+            const svg = e.currentTarget as SVGSVGElement;
+            const loc = clientToSvg(svg, e.clientX, e.clientY);
+
+            // 既存ノートのヒット
+            const hit = hitTestItemAtX(rowIndex, loc.x, loc.y);
+            const isBackground = !hit;
+
+            if (isBackground) cancelEditingAndSelection();
+
+            if (mode === "select") {
+              if (isBackground) {
+                setMarquee({ x0: loc.x, y0: loc.y, x1: loc.x, y1: loc.y });
+                setDraggingMarquee(true);
+              } else {
+                beginDragFromItem(e as any, hit!, rowIndex);
+              }
+              return;
+            }
+
+            if (mode === "draw") {
+              const y0 = pagePadding + topPadding;
+              const y = clamp(
+                loc.y,
+                y0 - stringGap / 2,
+                y0 + (stringCount - 1) * stringGap + stringGap / 2
+              );
+              const stringIndex = clamp(Math.round((y - y0) / stringGap), 0, stringCount - 1);
+              const { bar, tick } = quantizeX(loc.x);
+
+              placeAtRow(rowIndex, { bar, tick, stringIndex });
+
+              e.stopPropagation();
+              e.preventDefault();
+              return;
+            }
+          }}
+          onPointerUp={() => {
+            if (draggingMarquee && marquee) {
+              const rect = normRect(marquee);
+              const ids = items
+                .filter((it) => it.rowIndex === rowIndex)
+                .filter((it) => {
+                  const { x, y } = itemXYRow(it);
+                  return x >= rect.x && x <= rect.x + rect.w && y >= rect.y && y <= rect.y + rect.h;
+                })
+                .map((it) => it.id);
+              setSelectedIds(ids);
+            }
+            setDraggingMarquee(false);
+            setMarquee(null);
+          }}
+          className="row-svg"
+        >
+          {/* 背景 */}
+          <rect x={0} y={0} width={rowSvgWidth} height={rowSvgHeight} fill="white" />
+
+          {/* 縦グリッド（小節境界/拍/細分） */}
+          {[...Array(bars)].map((_, bar) => {
+            const barX = pagePadding + xOf(bar, 0);
+            return (
+              <g key={`bar-${bar}`}>
+                {/* 小節線 */}
+                <line x1={barX} x2={barX} y1={pagePadding + topPadding - 14} y2={pagePadding + topPadding + (stringCount - 1) * stringGap + 14}
+                      stroke="#adb5bd" strokeWidth={2} />
+                {/* 拍/細分 */}
+                {[...Array(ticksPerBar)].map((__, t) => {
+                  if (t === 0) return null;
+                  const x = pagePadding + xOf(bar, t);
+                  const isBeat = t % division === 0;
+                  if (showBeat && isBeat) {
+                    return <line key={`beat-${bar}-${t}`} x1={x} x2={x} y1={pagePadding + topPadding - 8} y2={pagePadding + topPadding + (stringCount - 1) * stringGap + 8} stroke="#cfd4da" strokeWidth={1} />;
+                  } else if (showSubdivision) {
+                    return <line key={`sub-${bar}-${t}`} x1={x} x2={x} y1={pagePadding + topPadding - 4} y2={pagePadding + topPadding + (stringCount - 1) * stringGap + 4} stroke="#edf2f4" strokeWidth={1} />;
+                  }
+                  return null;
+                })}
+                {/* 小節番号 */}
+                {showBarNumber && (
+                  <text x={barX + 6} y={pagePadding + topPadding - 10} fontSize={12} fill="#6c757d" fontFamily="ui-sans-serif, system-ui">{bar + 1}</text>
+                )}
+              </g>
+            );
+          })}
+          {/* 右端の終止線 */}
+          <line x1={pagePadding + leftPadding + bars * barPx}
+                x2={pagePadding + leftPadding + bars * barPx}
+                y1={pagePadding + topPadding - 14}
+                y2={pagePadding + topPadding + (stringCount - 1) * stringGap + 14}
+                stroke="#adb5bd" strokeWidth={2} />
+
+          {/* 弦 */}
+          {[...Array(6)].map((_, s) => (
+            <line key={`str-${s}`}
+                  x1={pagePadding + leftPadding}
+                  x2={pagePadding + leftPadding + bars * barPx}
+                  y1={yForString(s)} y2={yForString(s)} stroke="#212529" strokeWidth={1.2} />
+          ))}
+
+          {/* アイテム（この行だけ） */}
+          {items.filter(it => it.rowIndex === rowIndex).map(it => {
+            const x = pagePadding + xOf(it.bar, it.tick);
+            const y = yForString(it.stringIndex);
+            const sel = isSelected(it.id);
+            const label = it.kind === "mute" ? "×" : String(it.fret ?? 0);
+            return (
+              <g
+                key={it.id}
+                onPointerDown={(e) => {
+                  if (mode === "select") {
+                    e.stopPropagation();
+                    e.preventDefault();
+                    beginDragFromItem(e as any, it, rowIndex);
+                  }
+                }}
+                onDoubleClick={(e) => {
+                  e.stopPropagation();
+                  beginInlineEdit(it.id);
+                }}
+              >
+                {sel && (<rect x={x - 11} y={y - 11} width={22} height={16} rx={4} fill="white" stroke="#4c6ef5" />)}
+                {drawText(x, y, label)}
+              </g>
+            );
+          })}
+
+          {/* ドラッグ中プレビュー（この行だけ） */}
+          {(() => {
+            const ghost = computeDragPreview();
+            return ghost.filter(it => it.rowIndex === rowIndex).map(it => {
+              const x = pagePadding + xOf(it.bar, it.tick);
+              const y = yForString(it.stringIndex);
+              const label = it.kind === "mute" ? "×" : String(it.fret ?? 0);
+              const key = `ghost-${it.id}-${it.bar}-${it.tick}-${it.stringIndex}`;
+              return (
+                <g key={key} opacity={0.8} pointerEvents="none">
+                  <rect x={x - 11} y={y - 11} width={22} height={16} rx={4} fill="white" stroke="#94a3b8" strokeDasharray="3 2" />
+                  {drawText(x, y, label, "#94a3b8")}
+                </g>
+              );
+            });
+          })()}
+
+          {/* ホバーガイド（描画モード時のみ） */}
+          {(mode === "draw" && hoverPos) && (() => {
+            const x = pagePadding + xOf(hoverPos.bar, hoverPos.tick);
+            const y = yForString(hoverPos.stringIndex);
+            return (
+              <g>
+                <circle cx={x} cy={y} r={2} fill="#4c6ef5" />
+                {drawText(x, y, drawToken?.kind === "mute" ? "×" : String(drawToken?.value ?? 0), "#868e96")}
+              </g>
+            );
+          })()}
+
+          {/* 左端の縦線 */}
+          <line x1={pagePadding + leftPadding} x2={pagePadding + leftPadding}
+                y1={pagePadding + topPadding} y2={pagePadding + topPadding + (stringCount - 1) * stringGap}
+                stroke="#212529" strokeWidth={2} />
+
+          {/* インラインエディタ（この行に属する選択のみ） */}
+          {(() => {
+            if (!editingId) return null;
+            const n = items.find(x => x.id === editingId);
+            if (!n || n.rowIndex !== rowIndex) return null;
+            const pos = itemXYRow(n);
+            return (
+              <foreignObject x={pos.x - 14} y={pos.y - 14} width={32} height={24}>
+                <input
+                  autoFocus
+                  type="text"
+                  value={editValue}
+                  onChange={(e) => setEditValue(e.target.value.replace(/[^0-9]/g, ""))}
+                  onBlur={commitInlineEdit}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") commitInlineEdit();
+                    if (e.key === "Escape") { setEditingId(null); setSelectedIds([]); }
+                  }}
+                  style={{ width: "100%", height: "100%", textAlign: "center", fontWeight: 700, border: "1px solid #4c6ef5", borderRadius: 6, outline: "none" }}
+                />
+              </foreignObject>
+            );
+          })()}
+
+          {/* 矩形選択の可視化 */}
+          {marquee && (() => { const r = normRect(marquee); return (
+            <rect x={r.x} y={r.y} width={r.w} height={r.h} fill="rgba(76,110,245,0.08)" stroke="#4c6ef5" strokeDasharray="4 3" />
+          );})()}
+        </svg>
+      </div>
+    );
+
+    return (
+      <div className="row-wrap">
+        <LeftFixed />
+        <RightScroll />
+      </div>
+    );
+  };
+
+  // アンマウント時のクリーンアップ（ドラッグ中終了の保険）
+  useEffect(() => {
+    return () => {
+      try { cleanupDragSideEffects(); } catch {}
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  return (
+    <div
+      className="min-h-screen bg-neutral-50 text-neutral-800 p-6 select-none"
+      onPointerDown={(e) => { if (e.target === e.currentTarget) { cancelEditingAndSelection(); } }}
+    >
+      <div className="max-w-[1200px] mx-auto space-y-4">
+        {/* 固定ツールバー */}
+        <div className="toolbar-fixed" onPointerDown={(e) => { if (e.target === e.currentTarget) { cancelEditingAndSelection(); } }}>
+          <div className="toolbar-inner toolbar-layout">
+            <div className="pitch-row">{pitchText}</div>
+
+            {/* 左上：モード切替 */}
+            <div className="mode-row">
+              <button type="button" className="btn btn-toggle btn-sm" data-active={mode === 'select'} aria-pressed={mode === 'select'} title="選択モード" onClick={() => { cancelEditingAndSelection(); setMode('select'); }}>選択</button>
+              <button type="button" className="btn btn-toggle btn-sm" data-active={mode === 'draw'} aria-pressed={mode === 'draw'} title="描画モード" onClick={() => { cancelEditingAndSelection(); setMode('draw'); }}>描画</button>
+              {mode === 'draw' && (
+                <>
+                  <span className="sep-vert" />
+                  <span className="text-xs text-neutral-600">現在の描画: {drawToken?.kind === 'mute' ? '×' : (drawToken?.value ?? 0)}</span>
+                  <button className="btn btn-sm" title="ミュート（×）" onClick={() => setDrawToken({ kind: 'mute' })}>×</button>
+                </>
+              )}
+            </div>
+
+            {/* 左上の少し下：Reset / Undo / Redo */}
+            <div className="history-row">
+              <button className="btn btn-icon" title="全消し（Reset）" onClick={() => { if (!canReset) return; pushHistory(); setItems([]); setSelectedIds([]); setEditingId(null); }} disabled={!canReset} aria-disabled={!canReset}>Reset</button>
+              <button className="btn btn-icon" title="一つ戻る（Undo）" onClick={undo} disabled={!canUndo} aria-disabled={!canUndo}>↩︎</button>
+              <button className="btn btn-icon" title="一つ進む（Redo）" onClick={redo} disabled={!canRedo} aria-disabled={!canRedo}>↪︎</button>
+            </div>
+
+            {/* 左下：表示トグル */}
+            <div className="display-row">
+              <label className="chk"><input type="checkbox" checked={showBarNumber} onChange={(e) => setShowBarNumber(e.target.checked)} />小節番号</label>
+              <label className="chk"><input type="checkbox" checked={showBeat} onChange={(e) => setShowBeat(e.target.checked)} />拍グリッド</label>
+              <label className="chk"><input type="checkbox" checked={showSubdivision} onChange={(e) => setShowSubdivision(e.target.checked)} />細分線</label>
+              {selectedIds.length > 0 && (
+                <button className="btn btn-sm" title="選択を削除" onClick={() => { pushHistory(); setItems((arr) => arr.filter(i => !selectedIds.includes(i.id))); setSelectedIds([]); }}>削除</button>
+              )}
+            </div>
+
+            {/* 右上：書き出し（クリックで開くメニュー） */}
+            <div className="export-row">
+              <div className="export-menu" ref={exportMenuRef}>
+                <button
+                  type="button"
+                  className="btn btn-sm export-trigger"
+                  aria-haspopup="menu"
+                  aria-expanded={exportOpen}
+                  onClick={() => setExportOpen(v => !v)}
+                  onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") setExportOpen(v => !v); }}
+                  title="エクスポート形式を選択"
+                >
+                  エクスポート ▾
+                </button>
+
+                <div
+                  className="export-dropdown"
+                  role="menu"
+                  aria-label="エクスポート形式"
+                  data-open={exportOpen ? "true" : "false"}
+                >
+                  <button
+                    type="button"
+                    className="export-item"
+                    role="menuitem"
+                    onClick={() => { setExportOpen(false); downloadSVG(); }}
+                  >
+                    SVGで書き出す
+                  </button>
+                  <button
+                    type="button"
+                    className="export-item"
+                    role="menuitem"
+                    onClick={() => { setExportOpen(false); downloadPNG(); }}
+                  >
+                    PNGで書き出す
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            {/* 右下：小節/拍/分割/段数の設定 */}
+            <div className="settings-row">
+              <span className="label">小節:</span>
+              <input type="number" className="input w-20" value={bars} min={1} max={128}
+                     onChange={(e) => { cancelEditingAndSelection(); setBars(clamp(parseInt(e.target.value || '1'), 1, 128)); }} />
+              <span className="label">拍/小節:</span>
+              <input type="number" className="input w-20" value={beatsPerBar} min={1} max={12}
+                     onChange={(e) => { cancelEditingAndSelection(); setBeatsPerBar(clamp(parseInt(e.target.value || '4'), 1, 12)); }} />
+              <span className="label">分割:</span>
+              <select className="input" value={division} onChange={(e) => { cancelEditingAndSelection(); setDivision(parseInt(e.target.value, 10)); }}>
+                <option value={1}>1</option>
+                <option value={2}>2</option>
+                <option value={3}>3</option>
+                <option value={4}>4 (16分)</option>
+                <option value={6}>6</option>
+                <option value={8}>8</option>
+              </select>
+              <span className="label">1段の小節数:</span>
+              <select className="input" value={perSystemBars} onChange={(e) => { cancelEditingAndSelection(); setPerSystemBars(parseInt(e.target.value, 10)); }}>
+                {[2,3,4,6,8].map(n => <option key={n} value={n}>{n}</option>)}
+              </select>
+            </div>
+          </div>
+        </div>
+
+        {/* 固定ツールバー分のスペーサ */}
+        <div className="toolbar-spacer" />
+
+        {/* 行レンダリング（全行を同じ構造に統一） */}
+        <div className="sheet-wrap">
+          {Array.from({ length: rowCount }).map((_, i) => (
+            <div key={`row-${i}`} className="sheet-row">
+              {renderRow(i)}
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* 画面下の固定バー */}
+      <div className="bottom-fixed">
+        <button className="btn btn-sm" title="行を追加" onClick={() => setRowCount(n => Math.min(n + 1, 16))}>＋ 行を追加</button>
+        <button className="btn btn-sm" data-active={linkScroll} title={linkScroll ? "スクロール同期: ON（クリックで解除）" : "スクロール同期: OFF（クリックで有効）"} onClick={() => setLinkScroll(v => !v)}>
+          {linkScroll ? "🔗 Chain" : "⛓️ Unchain"}
+        </button>
+      </div>
+
+      <style jsx global>{`
+        .input { @apply border border-neutral-300 rounded-xl px-2 py-1 focus:outline-none focus:ring-2 focus:ring-neutral-400; }
+        .btn { @apply px-3 py-1.5 rounded-xl border border-neutral-300; }
+        .btn-toggle { @apply bg-white text-neutral-800 hover:bg-neutral-100; }
+        .btn-toggle[data-active="true"] { border-color: #3b82f6 !important; box-shadow: 0 0 0 2px rgba(59,130,246,0.9) !important; }
+        .btn-toggle[data-active="true"]:hover { background-color: #fff !important; }
+        .chk { @apply inline-flex items-center gap-2 text-sm text-neutral-700; }
+
+        .toolbar-fixed { position: fixed; top: 0; left: 0; right: 0; z-index: 100; background: #ffffff !important; border-bottom: 1px solid #e5e7eb; }
+        .toolbar-inner { max-width: 1200px; margin-left: auto; margin-right: auto; padding: 0.75rem; display: block; }
+        .toolbar-inner.toolbar-layout { position: relative; height: 105px; }
+        .toolbar-spacer { height: 150px; }
+
+        :root, html, body { color-scheme: light !important; }
+        html, body { background-color: #fafafa !important; color: #111 !important; }
+        button, input, select, textarea { background-color: #ffffff !important; color: #111 !important; border-color: #d4d4d8 !important; appearance: none; -webkit-appearance: none; }
+        .input { background-color: #ffffff !important; color: #111 !important; border-color: #d4d4d8 !important; }
+        .btn   { background-color: #ffffff !important; color: #111 !important; border-color: #d4d4d8 !important; }
+
+        input:-webkit-autofill { -webkit-text-fill-color: #111 !important; transition: background-color 9999s ease-out 0s; }
+        input:-webkit-autofill, input:-webkit-autofill:focus, select:-webkit-autofill, textarea:-webkit-autofill { -webkit-text-fill-color: #111 !important; box-shadow: 0 0 0px 1000px #ffffff inset !important; background-clip: padding-box !important; }
+        ::placeholder { color: #6b7280 !important; opacity: 1 !important; }
+        svg, svg * { -webkit-user-select: none !important; user-select: none !important; }
+        svg ::selection { background: transparent; }
+
+        .mode-row { position: absolute; top: 8px; left: 12px; display: inline-flex; gap: 6px; align-items: center; }
+        .history-row { position: absolute; top: 55px; left: 12px; display: inline-flex; gap: 6px; align-items: center; }
+        .display-row { position: absolute; bottom: 8px; left: 12px; display: inline-flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+        .export-row { position: absolute; top: 8px; right: 12px; display: inline-flex; gap: 8px; align-items: center; }
+        .settings-row { position: absolute; bottom: 8px; right: 12px; display: inline-flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+        .settings-row .label { font-size: 12px; color: #52525b; }
+
+        .pitch-row { position: absolute; top: 8px; left: 50%; transform: translateX(-50%); font-weight: 800; font-size: 40px; letter-spacing: 0.5px; color: #111; pointer-events: none; user-select: none; }
+
+        /* ===== 横スクロール行レイアウト ===== */
+        .row-wrap{display:flex;position:relative}
+        .sheet-row  { margin-bottom: 12px; }
+
+        :root { --row-stick-top: 150px; }
+        
+        .row-left-fixed{
+          position: relative;
+          left: auto;
+          top: auto;
+          z-index: 5;
+          flex: 0 0 calc(24px + 72px);
+          background:#fff;
+          border-right:1px solid #e5e7eb;
+          pointer-events:none;
+        }
+
+        .row-right-scroll{overflow-x:auto;overflow-y:hidden;flex:1 1 auto;-webkit-overflow-scrolling:touch}
+        .row-left-line{position:absolute;left:0;transform:translateY(-50%);width:calc(24px + 72px - 8px);text-align:right;padding-right:6px}
+        .row-left-name { font-family: ui-monospace, Menlo, monospace; font-size: 12px; color: #495057; }
+
+        /* ===== カーソル制御（点滅防止） ===== */
+        .row-svg { display:block; cursor: grab; }
+        .row-svg * { cursor: inherit !important; } /* テキスト/rect上でも同じカーソルに固定 */
+        .row-svg.dragging { cursor: grabbing !important; }
+        html[data-dragging="1"] * { cursor: grabbing !important; } /* ページ全体で固定 */
+
+        .bottom-fixed { position: fixed; left: 0; right: 0; bottom: 0; height: 44px; display: flex; gap: 8px; align-items: center; justify-content: center; background: rgba(255,255,255,0.96); border-top: 1px solid #e5e7eb; z-index: 80; }
+        .btn[data-active="true"] { border-color: #3b82f6 !important; box-shadow: 0 0 0 2px rgba(59,130,246,0.25) !important; }
+
+        /* ===== Export dropdown ===== */
+        .export-menu { position: relative; display: inline-block; }
+        .export-trigger { /* ボタン見た目は既存 .btn .btn-sm を流用 */ }
+
+        .export-dropdown {
+          display: none;
+          position: absolute;
+          right: 0;
+          top: calc(100% + 6px);
+          min-width: 160px;
+          background: #fff;
+          border: 1px solid #e5e7eb;
+          border-radius: 10px;
+          padding: 6px;
+          box-shadow: 0 12px 20px rgba(0,0,0,0.08);
+          z-index: 200;
+        }
+        .export-dropdown[data-open="true"] { display: block; }
+
+        .export-item {
+          width: 100%;
+          text-align: left;
+          padding: 8px 10px;
+          border-radius: 8px;
+          border: 0;
+          background: transparent;
+          font-size: 14px;
+          line-height: 1.2;
+          cursor: pointer;
+        }
+        .export-item:hover { background: #f3f4f6; }
+
+        /* ===== 余白干渉の無効化（安全側） ===== */
+        .toolbar-fixed + .toolbar-spacer { margin-top: 0 !important; }
+        .toolbar-spacer + .sheet-wrap { margin-top: 0 !important; }
+        .sheet-wrap { display: flow-root; }
+      `}</style>
+    </div>
+  );
+}
